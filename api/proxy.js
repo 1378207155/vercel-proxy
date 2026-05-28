@@ -1,6 +1,6 @@
-// api/proxy.js
+// api/proxy.js (套娃高匿版)
 export default async function handler(req, res) {
-  // 1. 处理 CORS 跨域预检 (OPTIONS)
+  // 1. 处理 CORS
   if (req.method === 'OPTIONS') {
     res.setHeader('Access-Control-Allow-Origin', '*');
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
@@ -8,70 +8,49 @@ export default async function handler(req, res) {
     return res.status(204).end();
   }
 
-  // 2. 获取目标 URL (支持 ?url= 参数)
   const targetUrl = req.query.url;
   if (!targetUrl) {
-    return res.status(400).json({ error: 'Missing ?url= parameter', usage: '/?url=https://example.com' });
+    return res.status(400).json({ error: 'Missing ?url=' });
   }
 
-  let targetURL;
-  try {
-    targetURL = new URL(targetUrl);
-  } catch (e) {
-    return res.status(400).json({ error: 'Invalid URL format' });
-  }
+  // 2. 核心：使用公共代理池进行“套娃”转发
+  // 这里使用 corsproxy.io 作为中间人，彻底切断 Vercel 与目标站的直接联系
+  const proxyMiddleman = "https://corsproxy.io/?";
+  const finalUrl = proxyMiddleman + encodeURIComponent(targetUrl);
 
-  // 3. 生成随机 IP (核心：Vercel 出口不会强制覆盖它)
-  const fakeIp = Array.from({length: 4}, () => Math.floor(Math.random() * 254) + 1).join('.');
-
-  // 4. 构造请求头
+  // 3. 构造请求头 (只传基础头，IP 伪造交给中间人)
   const headers = new Headers();
+  headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36');
+  headers.set('Accept', 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8');
   
-  // 透传安全的客户端请求头
-  const allowedHeaders = ['accept', 'accept-language', 'authorization', 'cache-control', 'content-type', 'referer'];
-  for (const key of allowedHeaders) {
-    if (req.headers[key]) headers.set(key, req.headers[key]);
-  }
-  
-  // 【高匿核心】强制伪造 IP 和 Host
-  headers.set('X-Forwarded-For', fakeIp);
-  headers.set('X-Real-IP', fakeIp);
-  headers.set('Host', targetURL.hostname);
-  
-  // 伪装现代浏览器 (如果客户端没传 UA)
-  if (!req.headers['user-agent']) {
-    headers.set('User-Agent', 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36');
-  } else {
-    headers.set('User-Agent', req.headers['user-agent']);
-  }
+  // 透传客户端的 Cookie 和 Authorization (如果需要登录态)
+  if (req.headers['cookie']) headers.set('Cookie', req.headers['cookie']);
+  if (req.headers['authorization']) headers.set('Authorization', req.headers['authorization']);
 
   try {
-    // 5. 发起请求 (Vercel Node 18+ 原生支持 fetch)
-    const response = await fetch(targetURL.toString(), {
+    // 4. Vercel 请求中间人，中间人请求目标站
+    const response = await fetch(finalUrl, {
       method: req.method,
       headers: headers,
-      body: ['GET', 'HEAD'].includes(req.method) ? undefined : JSON.stringify(req.body), // 简单处理 POST body
+      body: ['GET', 'HEAD'].includes(req.method) ? undefined : JSON.stringify(req.body),
       redirect: 'follow'
     });
 
-    // 6. 设置 CORS 响应头
+    // 5. 设置 CORS 并返回
     res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', '*');
     
-    // 7. 透传目标站的响应头 (剔除会导致乱码的编码头)
     response.headers.forEach((value, key) => {
       if (!['content-encoding', 'content-length', 'transfer-encoding', 'connection'].includes(key.toLowerCase())) {
         res.setHeader(key, value);
       }
     });
 
-    // 8. 返回数据流
     res.status(response.status);
     const arrayBuffer = await response.arrayBuffer();
     res.send(Buffer.from(arrayBuffer));
 
   } catch (error) {
-    res.status(500).json({ error: 'Proxy failed', message: error.message });
+    res.status(500).json({ error: 'Proxy chain failed', message: error.message });
   }
 }
